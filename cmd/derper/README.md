@@ -95,6 +95,9 @@ analysis to diagnose the most tricky problems. There is no "plain text" or
 * Prometheus compatible metrics can be gathered from the debug handler at
   `/debug/varz`.
 
+* Per-node, per-period DERP payload counters are available as JSON at
+  `/debug/traffik`.
+
 * `cmd/stunc` in the Tailscale repository provides a basic tool for diagnosing
   issues with STUN.
 

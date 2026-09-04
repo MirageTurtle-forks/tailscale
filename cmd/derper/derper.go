@@ -91,6 +91,9 @@ var (
 
 	rateConfigPath = flag.String("rate-config", "", "if non-empty, path to JSON rate limit config file. Rate limiting is experimental and subject to change. Configuration is reloaded on SIGHUP.")
 
+	nodeTrafficPeriod = flag.Duration("node-traffic-period", time.Minute, "period over which per-node DERP payload byte counters are collected")
+	nodeTrafficLog    = flag.Bool("node-traffic-log", false, "write completed per-node traffic periods as JSON lines to stdout")
+
 	// tcpKeepAlive is intentionally long, to reduce battery cost. There is an L7 keepalive on a higher frequency schedule.
 	tcpKeepAlive = flag.Duration("tcp-keepalive-time", 10*time.Minute, "TCP keepalive time")
 	// tcpUserTimeout is intentionally short, so that hung connections are cleaned up promptly. DERPs should be nearby users.
@@ -112,6 +115,34 @@ const meshKeyEnvVar = "TAILSCALE_DERPER_MESH_KEY"
 
 type config struct {
 	PrivateKey key.NodePrivate
+}
+
+type nodeTrafficLogRecord struct {
+	PeriodStart   time.Time      `json:"period_start"`
+	PeriodEnd     time.Time      `json:"period_end"`
+	NodeKey       key.NodePublic `json:"node_key"`
+	SentBytes     uint64         `json:"sent_bytes"`
+	ReceivedBytes uint64         `json:"received_bytes"`
+}
+
+func writeNodeTrafficLog(enc *json.Encoder, snapshot derpserver.NodeTrafficSnapshot) error {
+	for _, node := range snapshot.Nodes {
+		record := nodeTrafficLogRecord{
+			PeriodStart:   snapshot.Start,
+			PeriodEnd:     snapshot.End,
+			NodeKey:       node.Node,
+			SentBytes:     node.SentBytes,
+			ReceivedBytes: node.ReceivedBytes,
+		}
+		if err := enc.Encode(record); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func registerNodeTrafficDebug(debug *tsweb.DebugHandler, s *derpserver.Server) {
+	debug.Handle("traffik", "Per-node traffic accounting", http.HandlerFunc(s.ServeDebugTraffik))
 }
 
 func loadConfig() config {
@@ -166,6 +197,9 @@ func main() {
 		fmt.Println(version.Long())
 		return
 	}
+	if *nodeTrafficPeriod <= 0 {
+		log.Fatalf("--node-traffic-period must be positive")
+	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
@@ -199,6 +233,22 @@ func main() {
 		s.SetDisallowedAppNames(strings.Split(*disallowAppNames, ","))
 	}
 	s.SetTCPWriteTimeout(*tcpWriteTimeout)
+	var emitNodeTraffic func(derpserver.NodeTrafficSnapshot)
+	if *nodeTrafficLog {
+		enc := json.NewEncoder(os.Stdout)
+		emitNodeTraffic = func(snapshot derpserver.NodeTrafficSnapshot) {
+			if err := writeNodeTrafficLog(enc, snapshot); err != nil {
+				log.Printf("writing node traffic log: %v", err)
+			}
+		}
+	}
+	nodeTrafficDone := make(chan struct{})
+	go func() {
+		defer close(nodeTrafficDone)
+		if err := s.RunNodeTrafficMetrics(ctx, *nodeTrafficPeriod, emitNodeTraffic); err != nil {
+			log.Printf("node traffic metrics: %v", err)
+		}
+	}()
 	if *rateConfigPath != "" {
 		if err := s.LoadAndApplyRateConfig(*rateConfigPath); err != nil {
 			log.Fatalf("derper: loading rate config: %v", err)
@@ -303,6 +353,7 @@ func main() {
 		}
 	}))
 	debug.Handle("traffic", "Traffic check", http.HandlerFunc(s.ServeDebugTraffic))
+	registerNodeTrafficDebug(debug, s)
 	debug.Handle("set-mutex-profile-fraction", "SetMutexProfileFraction", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		s := r.FormValue("rate")
 		if s == "" || r.Header.Get("Sec-Debug") != "derp" {
@@ -426,6 +477,8 @@ func main() {
 		}
 		err = httpsrv.Serve(ln)
 	}
+	cancel()
+	<-nodeTrafficDone
 	if err != nil && err != http.ErrServerClosed {
 		log.Fatalf("derper: %v", err)
 	}

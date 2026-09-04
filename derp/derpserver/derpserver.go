@@ -223,7 +223,17 @@ type Server struct {
 	// calling their funcs in a new goroutine.
 	peerGoneWatchers map[key.NodePublic]set.HandleSet[func(key.NodePublic)]
 	// maps from netip.AddrPort to a client's public key
-	keyOfAddr  map[netip.AddrPort]key.NodePublic
+	keyOfAddr map[netip.AddrPort]key.NodePublic
+
+	// nodeTrafficPeriodStart, nodeTrafficUnregistered, and nodeTrafficLast
+	// contain the state for per-node, per-period traffic accounting. Traffic
+	// for connected clients lives in atomics on sclient so that recording it
+	// does not require taking Server.mu on the packet hot path.
+	nodeTrafficPeriodStart  time.Time
+	nodeTrafficUnregistered map[key.NodePublic]nodeTrafficCounts
+	nodeTrafficLast         *NodeTrafficSnapshot
+	nodeTrafficRunning      bool
+
 	rateConfig RateConfig // per-client DERP frame rate limiting config
 }
 
@@ -377,25 +387,27 @@ func New(privateKey key.NodePrivate, logf logger.Logf) *Server {
 	runtime.ReadMemStats(&ms)
 
 	s := &Server{
-		debug:               envknob.Bool("DERP_DEBUG_LOGS"),
-		privateKey:          privateKey,
-		publicKey:           privateKey.Public(),
-		logf:                logf,
-		limitedLogf:         logger.RateLimitedFn(logf, 30*time.Second, 5, 100),
-		packetsRecvByKind:   metrics.LabelMap{Label: "kind"},
-		clientsMesh:         map[key.NodePublic]PacketForwarder{},
-		netConns:            map[derp.Conn]chan struct{}{},
-		memSys0:             ms.Sys,
-		watchers:            set.Set[*sclient]{},
-		peerGoneWatchers:    map[key.NodePublic]set.HandleSet[func(key.NodePublic)]{},
-		avgQueueDuration:    new(uint64),
-		tcpRtt:              metrics.LabelMap{Label: "le"},
-		meshUpdateBatchSize: metrics.NewHistogram([]float64{0, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000}),
-		meshUpdateLoopCount: metrics.NewHistogram([]float64{0, 1, 2, 5, 10, 20, 50, 100}),
-		bufferedWriteFrames: metrics.NewHistogram([]float64{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 15, 20, 25, 50, 100}),
-		keyOfAddr:           map[netip.AddrPort]key.NodePublic{},
-		clock:               tstime.StdClock{},
-		tcpWriteTimeout:     DefaultTCPWiteTimeout,
+		debug:                   envknob.Bool("DERP_DEBUG_LOGS"),
+		privateKey:              privateKey,
+		publicKey:               privateKey.Public(),
+		logf:                    logf,
+		limitedLogf:             logger.RateLimitedFn(logf, 30*time.Second, 5, 100),
+		packetsRecvByKind:       metrics.LabelMap{Label: "kind"},
+		clientsMesh:             map[key.NodePublic]PacketForwarder{},
+		netConns:                map[derp.Conn]chan struct{}{},
+		memSys0:                 ms.Sys,
+		watchers:                set.Set[*sclient]{},
+		peerGoneWatchers:        map[key.NodePublic]set.HandleSet[func(key.NodePublic)]{},
+		avgQueueDuration:        new(uint64),
+		tcpRtt:                  metrics.LabelMap{Label: "le"},
+		meshUpdateBatchSize:     metrics.NewHistogram([]float64{0, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000}),
+		meshUpdateLoopCount:     metrics.NewHistogram([]float64{0, 1, 2, 5, 10, 20, 50, 100}),
+		bufferedWriteFrames:     metrics.NewHistogram([]float64{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 15, 20, 25, 50, 100}),
+		keyOfAddr:               map[netip.AddrPort]key.NodePublic{},
+		nodeTrafficPeriodStart:  time.Now().UTC(),
+		nodeTrafficUnregistered: map[key.NodePublic]nodeTrafficCounts{},
+		clock:                   tstime.StdClock{},
+		tcpWriteTimeout:         DefaultTCPWiteTimeout,
 	}
 	s.initMetacert()
 	s.packetsRecvDisco = s.packetsRecvByKind.Get(string(packetKindDisco))
@@ -851,6 +863,7 @@ func (s *Server) broadcastPeerStateChangeLocked(peer key.NodePublic, ipPort neti
 func (s *Server) unregisterClient(c *sclient) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.stashNodeTrafficLocked(c)
 
 	set, ok := s.clients.Load(c.key)
 	if !ok {
@@ -1344,6 +1357,7 @@ func (c *sclient) handleFrameSendPacket(_ derp.FrameType, fl uint32) error {
 	if err != nil {
 		return fmt.Errorf("client %v: recvPacket: %v", c.key, err)
 	}
+	c.recordNodeSentBytes(len(contents))
 
 	dst, fwd, dstLen := c.lookupDest(dstKey)
 
@@ -1863,6 +1877,12 @@ type sclient struct {
 	isDisabled     atomic.Bool      // whether sends to this peer are disabled due to active/active dups
 	debug          bool             // turn on for verbose logging
 
+	// nodeSentBytes and nodeReceivedBytes are DERP payload bytes from the
+	// node's perspective. They are swapped to zero when a traffic accounting
+	// period is rotated.
+	nodeSentBytes     atomic.Uint64
+	nodeReceivedBytes atomic.Uint64
+
 	// Owned by run, not thread-safe.
 	br          *bufio.Reader
 	connectedAt time.Time
@@ -2244,6 +2264,7 @@ func (c *sclient) sendPacket(srcKey key.NodePublic, contents []byte) (err error)
 		} else {
 			c.s.packetsSent.Add(1)
 			c.s.bytesSent.Add(int64(len(contents)))
+			c.recordNodeReceivedBytes(len(contents))
 		}
 		c.debugLogf("sendPacket from %s: %v", srcKey.ShortString(), err)
 	}()
