@@ -7,6 +7,7 @@ package stunserver
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"io"
 	"log"
@@ -32,13 +33,77 @@ var (
 )
 
 type STUNServer struct {
-	ctx context.Context // ctx signals service shutdown
-	pc  *net.UDPConn    // pc is the UDP listener
+	ctx          context.Context // ctx signals service shutdown
+	pc           *net.UDPConn    // pc is the UDP listener
+	eventHandler func(Event)
+}
+
+// EventStatus describes the terminal result of processing a STUN server event.
+type EventStatus string
+
+const (
+	EventStatusSuccess        EventStatus = "success"
+	EventStatusNotSTUN        EventStatus = "not_stun"
+	EventStatusInvalidRequest EventStatus = "invalid_request"
+	EventStatusReadError      EventStatus = "read_error"
+	EventStatusWriteError     EventStatus = "write_error"
+)
+
+// Event contains one raw STUN server event. RequestIP and RequestPort identify
+// the source observed by the server. MappedIP and MappedPort are returned to the
+// requester. ServerIP and ServerPort identify the listener; ServerIP may be
+// unspecified when the server listens on all interfaces.
+type Event struct {
+	EventType     string      `json:"event_type"`
+	Time          time.Time   `json:"time"`
+	RequestIP     netip.Addr  `json:"request_ip,omitzero"`
+	RequestPort   uint16      `json:"request_port,omitempty"`
+	ServerIP      netip.Addr  `json:"server_ip,omitzero"`
+	ServerPort    uint16      `json:"server_port,omitempty"`
+	MappedIP      netip.Addr  `json:"mapped_ip,omitzero"`
+	MappedPort    uint16      `json:"mapped_port,omitempty"`
+	AddressFamily string      `json:"address_family,omitempty"`
+	TransactionID string      `json:"transaction_id,omitempty"`
+	RequestBytes  int         `json:"request_bytes,omitempty"`
+	ResponseBytes int         `json:"response_bytes,omitempty"`
+	Status        EventStatus `json:"status"`
+	Error         string      `json:"error,omitempty"`
 }
 
 // New creates a new STUN server. The server is shutdown when ctx is done.
 func New(ctx context.Context) *STUNServer {
 	return &STUNServer{ctx: ctx}
+}
+
+// SetEventHandler configures h to receive one synchronous callback for every
+// UDP datagram processed by the server and every non-terminal socket read
+// error. It must be called before Serve. A slow handler applies backpressure to
+// STUN processing.
+func (s *STUNServer) SetEventHandler(h func(Event)) {
+	s.eventHandler = h
+}
+
+func (s *STUNServer) emitEvent(e Event) {
+	if s.eventHandler != nil {
+		s.eventHandler(e)
+	}
+}
+
+func (s *STUNServer) serverAddrPort() netip.AddrPort {
+	if s.pc == nil {
+		return netip.AddrPort{}
+	}
+	return s.pc.LocalAddr().(*net.UDPAddr).AddrPort()
+}
+
+func (s *STUNServer) newEvent() Event {
+	serverAddr := s.serverAddrPort()
+	return Event{
+		EventType:  "stun",
+		Time:       time.Now().UTC(),
+		ServerIP:   serverAddr.Addr(),
+		ServerPort: serverAddr.Port(),
+	}
 }
 
 // Listen binds the listen socket for the server at listenAddr.
@@ -74,34 +139,62 @@ func (s *STUNServer) Serve() error {
 			if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
 				return nil
 			}
+			event := s.newEvent()
+			event.Status = EventStatusReadError
+			event.Error = err.Error()
+			s.emitEvent(event)
 			log.Printf("STUN ReadFrom: %v", err)
 			time.Sleep(time.Second)
 			stunReadError.Add(1)
 			continue
 		}
+		event := s.newEvent()
+		requestAddr := ua.AddrPort()
+		event.RequestIP = requestAddr.Addr()
+		event.RequestPort = requestAddr.Port()
+		event.RequestBytes = n
+		if ua.IP.To4() != nil {
+			event.AddressFamily = "ipv4"
+		} else {
+			event.AddressFamily = "ipv6"
+		}
 		pkt := buf[:n]
 		if !stun.Is(pkt) {
 			stunNotSTUN.Add(1)
+			event.Status = EventStatusNotSTUN
+			s.emitEvent(event)
 			continue
 		}
 		txid, err := stun.ParseBindingRequest(pkt)
 		if err != nil {
 			stunNotSTUN.Add(1)
+			event.Status = EventStatusInvalidRequest
+			event.Error = err.Error()
+			s.emitEvent(event)
 			continue
 		}
+		event.TransactionID = hex.EncodeToString(txid[:])
 		if ua.IP.To4() != nil {
 			stunIPv4.Add(1)
 		} else {
 			stunIPv6.Add(1)
 		}
 		addr, _ := netip.AddrFromSlice(ua.IP)
-		res := stun.Response(txid, netip.AddrPortFrom(addr, uint16(ua.Port)))
+		mappedAddr := netip.AddrPortFrom(addr, uint16(ua.Port))
+		event.MappedIP = mappedAddr.Addr()
+		event.MappedPort = mappedAddr.Port()
+		res := stun.Response(txid, mappedAddr)
+		event.ResponseBytes = len(res)
 		_, err = s.pc.WriteTo(res, ua)
 		if err != nil {
 			stunWriteError.Add(1)
+			event.Status = EventStatusWriteError
+			event.Error = err.Error()
 		} else {
 			stunSuccess.Add(1)
+			event.Status = EventStatusSuccess
 		}
+		s.emitEvent(event)
 	}
 }
 

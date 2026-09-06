@@ -93,6 +93,7 @@ var (
 
 	nodeTrafficPeriod = flag.Duration("node-traffic-period", time.Minute, "period over which per-node DERP payload byte counters are collected")
 	nodeTrafficLog    = flag.Bool("node-traffic-log", false, "write completed per-node traffic periods as JSON lines to stdout")
+	stunEventLog      = flag.Bool("stun-event-log", false, "write one raw STUN event per line as JSON to stdout")
 
 	// tcpKeepAlive is intentionally long, to reduce battery cost. There is an L7 keepalive on a higher frequency schedule.
 	tcpKeepAlive = flag.Duration("tcp-keepalive-time", 10*time.Minute, "TCP keepalive time")
@@ -217,6 +218,14 @@ func main() {
 
 	if *runSTUN {
 		ss := stunserver.New(ctx)
+		if *stunEventLog {
+			enc := json.NewEncoder(os.Stdout)
+			ss.SetEventHandler(func(event stunserver.Event) {
+				if err := enc.Encode(event); err != nil {
+					log.Printf("writing STUN event log: %v", err)
+				}
+			})
+		}
 		go ss.ListenAndServe(net.JoinHostPort(listenHost, fmt.Sprint(*stunPort)))
 	}
 
